@@ -7,12 +7,19 @@ import numpy as np
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
-
+import soundfile as sf
 MAX_WAV_VALUE = 32768.0
+import sklearn
+import skimage
+import skimage.filters
+import librosa
+def pad_to(in_tens,tgt_size):
+  pad_v = torch.zeros([tgt_size - in_tens.size(0)],dtype=in_tens.dtype)
+  return torch.cat((in_tens,pad_v))
 
 
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
+    data, sampling_rate = sf.read(full_path)
     return data, sampling_rate
 
 
@@ -62,7 +69,7 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     y = y.squeeze(1)
 
     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
+                      center=center, pad_mode='reflect', return_complex=False, normalized=False, onesided=True)
 
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
@@ -73,19 +80,22 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
 
 def get_dataset_filelist(a):
+
+        
     with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                          for x in fi.read().split('\n') if len(x) > 0]
+        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+                          for x in fi.read().split('\n') if len(x) > 0 and not "IPA" in x]
 
     with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                            for x in fi.read().split('\n') if len(x) > 0]
+        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+                            for x in fi.read().split('\n') if len(x) > 0 and not "IPA" in x]
+    
     return training_files, validation_files
 
 
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self, training_files, segment_size, n_fft, num_mels,
-                 hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
+                 hop_size, win_size, sampling_rate,  fmin, fmax, pre_blur, blur_sigma=1.0729, split=True, shuffle=True, n_cache_reuse=1,
                  device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None):
         self.audio_files = training_files
         random.seed(1234)
@@ -107,14 +117,47 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
+        self.pre_blur = pre_blur
+        self.blur_sigma = blur_sigma
+        self.bad_indexes = []
+        self.num_resample_warns = 0
+        self.num_resample_warns_max = 10
+        if fine_tuning:
+            print(f"Load mels from {base_mels_path}")
 
     def __getitem__(self, index):
+        if index in self.bad_indexes:
+            return self.__getitem__(index + 1)
+            
         filename = self.audio_files[index]
         if self._cache_ref_count == 0:
-            audio, sampling_rate = load_wav(filename)
+            try:
+                filen, ext = os.path.splitext(filename)
+                file_p_path = filename.replace(ext, "_p.ogg")
+                if os.path.isfile(file_p_path):
+                    filename = file_p_path
+                    
+                audio, sampling_rate = load_wav(filename)
+                if sampling_rate != self.sampling_rate:
+                    if self.num_resample_warns < self.num_resample_warns_max:
+                        print(f"File SR {sampling_rate} != {self.sampling_rate}.. resampling and re-saving to {file_p_path}\nthis will only print {self.num_resample_warns_max} times")
+                        self.num_resample_warns += 1
+                    
+                    audio = librosa.resample(audio, sampling_rate, self.sampling_rate, res_type="kaiser_fast")
+                    sampling_rate = self.sampling_rate
+                    sf.write(file_p_path, audio, sampling_rate)
+                    
+            except KeyboardInterrupt:
+                return None
+            except:
+                print(f"Could not open file {filename}")
+                self.bad_indexes.append(index)
+                return self.__getitem__(index + 1)
+                
+            
             audio = audio / MAX_WAV_VALUE
-            if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
+            
+            audio = normalize(audio) * 0.95
             self.cached_wav = audio
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} SR doesn't match target {} SR".format(
@@ -139,10 +182,18 @@ class MelDataset(torch.utils.data.Dataset):
             mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
                                   center=False)
+            if self.pre_blur:
+                mel = torch.from_numpy(
+                    skimage.filters.gaussian(mel.squeeze().cpu().numpy(), 
+                                             sigma=self.blur_sigma, channel_axis=0)).unsqueeze(0)
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
+
             mel = torch.from_numpy(mel)
+            
+            if torch.isnan(mel).any():
+                raise ValueError(f"NaN in mel {filename}")
 
             if len(mel.shape) < 3:
                 mel = mel.unsqueeze(0)
@@ -158,11 +209,26 @@ class MelDataset(torch.utils.data.Dataset):
                     mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
+        
+        audio_sq = audio.squeeze(0)
+        
+        if len(audio_sq) != self.segment_size and self.split:
+            if len(audio_sq) < self.segment_size:
+                audio_sq = pad_to(audio_sq,self.segment_size)
+            else:
+                audio_sq = audio_sq[:self.segment_size]
+            
+            
+            audio = audio_sq.unsqueeze(0)
+        
+        
         mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
                                    center=False)
 
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        mel_ret, audio_ret, ml_ret = mel.squeeze(), audio.squeeze(0), mel_loss.squeeze()
+
+        return (mel_ret, audio_ret, filename, ml_ret)
 
     def __len__(self):
         return len(self.audio_files)
